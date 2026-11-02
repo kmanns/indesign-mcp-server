@@ -8,17 +8,22 @@ import {
   ListToolsRequestSchema,
   McpError,
 } from '@modelcontextprotocol/sdk/types.js';
-import { execSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
-import os from 'os';
 import { fileURLToPath } from 'url';
+import { InDesignBridge } from './bridge.js';
+import { FilePolicy, compileValidators, secureSchema, destructiveTools, validateSemantics, jsxString, jsxLiteral, adobePath } from './security.js';
+import { dataMergeTools, runDataMergeTool } from './data-merge.js';
 
 const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
-class InDesignMCPServer {
-  constructor() {
+export class InDesignMCPServer {
+  constructor({ env = process.env, bridge = new InDesignBridge({ env }) } = {}) {
+    this.env = { ...env };
+    this.bridge = bridge;
+    this.files = new FilePolicy(env);
+    this.unsavedDocuments = new Set();
+    this.queue = Promise.resolve();
     this.server = new Server(
       {
         name: 'indesign-server-complete',
@@ -31,93 +36,21 @@ class InDesignMCPServer {
       }
     );
 
-    // Security: Define allowed directories for file operations
-    this.allowedDirectories = [
-      os.homedir(), // User home directory
-      '/Users/Shared', // Shared directory
-      // Add more as needed via environment variable
-      ...(process.env.INDESIGN_ALLOWED_DIRS ? process.env.INDESIGN_ALLOWED_DIRS.split(':') : [])
-    ];
-
     this.setupToolHandlers();
   }
 
-  // Security: Path validation to prevent directory traversal
-  validateFilePath(filePath) {
-    if (!filePath || typeof filePath !== 'string') {
-      throw new Error('Invalid file path provided');
-    }
-
-    // Resolve to absolute path
-    const resolvedPath = path.resolve(filePath);
-    
-    // Check if path is within allowed directories
-    const isAllowed = this.allowedDirectories.some(allowedDir => {
-      const resolvedAllowedDir = path.resolve(allowedDir);
-      return resolvedPath.startsWith(resolvedAllowedDir + path.sep) || resolvedPath === resolvedAllowedDir;
-    });
-
-    if (!isAllowed) {
-      throw new Error(`Access denied: Path '${filePath}' is outside allowed directories. Allowed: ${this.allowedDirectories.join(', ')}`);
-    }
-
-    // Additional security checks
-    if (resolvedPath.includes('..')) {
-      throw new Error('Path traversal detected: .. not allowed in resolved path');
-    }
-
-    // Prevent access to sensitive system files
-    const prohibitedPaths = ['/etc', '/System', '/usr/bin', '/bin', '/sbin'];
-    const isProhibited = prohibitedPaths.some(prohibited => 
-      resolvedPath.startsWith(prohibited + path.sep) || resolvedPath === prohibited
-    );
-
-    if (isProhibited) {
-      throw new Error(`Access denied: Cannot access system directory '${resolvedPath}'`);
-    }
-
-    return resolvedPath;
+  validateFilePath(filePath, options) {
+    return this.files.validate(filePath, options);
   }
 
-  // Security: User confirmation for destructive operations
-  async requireUserConfirmation(operation, target, details = '') {
-    const warningMessage = `
-⚠️  DESTRUCTIVE OPERATION WARNING ⚠️
-
-Operation: ${operation}
-Target: ${target}
-${details ? `Details: ${details}` : ''}
-
-This operation may:
-- Overwrite existing files
-- Permanently delete data
-- Modify system files
-
-Type 'CONFIRM' to proceed or 'CANCEL' to abort:`;
-
-    // In a real implementation, this would show a dialog or CLI prompt
-    // For MCP context, we throw an error requiring explicit confirmation
-    throw new McpError(
-      ErrorCode.InvalidRequest,
-      `Security confirmation required for destructive operation: ${operation} on ${target}. 
-      
-Add 'confirmDestructive: true' parameter to bypass this safety check.
-      
-CAUTION: Only do this if you understand the risks and have verified the operation details.`
-    );
-  }
-
-  // Security: Check if user has explicitly confirmed destructive operation
   validateDestructiveOperation(args, operation, target) {
-    if (!args.confirmDestructive) {
-      this.requireUserConfirmation(operation, target);
+    if (this.env.INDESIGN_ALLOW_DESTRUCTIVE !== '1' || args.confirmDestructive !== true) {
+      throw new Error(`Blocked ${operation} on ${target}: requires operator policy INDESIGN_ALLOW_DESTRUCTIVE=1 and confirmDestructive: true. The argument is not independent human approval.`);
     }
-    // User has explicitly confirmed - proceed with operation
   }
 
   setupToolHandlers() {
-    this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
-      tools: [
+    this.tools = [
         // =================== DOCUMENT MANAGEMENT ===================
         {
           name: 'get_document_info',
@@ -815,28 +748,69 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
             },
           },
         },
-        {
-          name: 'data_merge',
-          description: 'Perform data merge operation',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              dataSourcePath: { type: 'string', description: 'Path to CSV data source' },
-              outputFolder: { type: 'string', description: 'Output folder for merged documents' },
-              fileFormat: { type: 'string', enum: ['INDD', 'PDF', 'BOTH'], default: 'PDF' },
-              recordRange: { type: 'string', description: 'Record range (e.g., "1-10", "all")', default: 'all' },
-              confirmDestructive: { type: 'boolean', description: 'REQUIRED: Confirm bulk file creation', default: false },
-            },
-            required: ['dataSourcePath', 'outputFolder'],
-          },
-        },
-      ],
+      ].concat(dataMergeTools)
+        .map(tool => ({ ...tool, inputSchema: secureSchema(tool) }));
+    this.tools.push({
+      name: 'get_application_info',
+      description: 'Read selected InDesign application path and installed version without launching it',
+      inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+    });
+    this.validators = compileValidators(this.tools);
+    this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
+      tools: this.tools.filter(tool => tool.name !== 'execute_indesign_code' || this.env.INDESIGN_ALLOW_ARBITRARY_CODE === '1'),
     }));
+    this.server.setRequestHandler(CallToolRequestSchema, request => this.handleTool(request.params.name, request.params.arguments));
+  }
 
-    this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
-      const { name, arguments: args } = request.params;
-
+  handleTool(name, input = {}) {
+    const operation = this.queue.then(async () => {
+      this.currentTool = name;
+      this.approvedPaths = [];
+      let createdDirectory;
       try {
+        const validate = this.validators.get(name);
+        if (!validate) throw new Error(`Unknown tool: ${name}`);
+        if (!input || Object.getPrototypeOf(input) !== Object.prototype || !validate(input)) {
+          throw new Error(`Invalid arguments: ${JSON.stringify(validate.errors)}`);
+        }
+        if (JSON.stringify(input).length > 2 * 1024 * 1024) throw new Error('Tool arguments exceed 2 MB limit');
+        const args = structuredClone(input);
+        validateSemantics(name, args);
+        if (destructiveTools.has(name)) this.validateDestructiveOperation(args, name, 'selected document/output');
+        if (name === 'execute_indesign_code' && this.env.INDESIGN_ALLOW_ARBITRARY_CODE !== '1') throw new Error('Arbitrary code execution is disabled');
+        if (name === 'get_application_info') return this.formatResponse(JSON.stringify(this.bridge.applicationInfo()), 'Selected application');
+        if (dataMergeTools.some(tool => tool.name === name)) return await runDataMergeTool(this, name, args);
+        for (const key of ['filePath', 'imagePath', 'folderPath', 'outputFolder']) {
+          if (args[key] === undefined) continue;
+          args[key] = this.files.validate(args[key], {
+              existing: name === 'open_document' || key === 'imagePath',
+              directory: key === 'folderPath' || key === 'outputFolder',
+            });
+          this.approvedPaths.push({ path: args[key], directory: key === 'folderPath' || key === 'outputFolder' });
+        }
+        if (name === 'open_document' && !/\.(indd|idml|indt)$/i.test(args.filePath)) throw new Error('Open only INDD, IDML or INDT documents');
+        if (name === 'save_document' && args.filePath && !/\.indd$/i.test(args.filePath)) throw new Error('Save requires an .indd filePath');
+        if (name === 'place_image' && !/\.(png|jpe?g|tiff?|gif|psd|ai|eps|pdf|svg)$/i.test(args.imagePath)) throw new Error('Unsupported placed image format');
+        const outputDirectory = args.folderPath ?? args.outputFolder;
+        if (outputDirectory) {
+          fs.mkdirSync(outputDirectory, { mode: 0o700 });
+          createdDirectory = outputDirectory;
+        }
+        return await this.dispatchTool(name, args);
+      } catch (error) {
+        return { isError: true, content: [{ type: 'text', text: `Error executing ${name}: ${error.message}` }] };
+      } finally {
+        if (createdDirectory && fs.existsSync(createdDirectory) && fs.readdirSync(createdDirectory).length === 0) fs.rmdirSync(createdDirectory);
+        this.currentTool = undefined;
+        this.approvedPaths = undefined;
+        this.requestedDocument = undefined;
+      }
+    });
+    this.queue = operation.catch(() => {});
+    return operation;
+  }
+
+  async dispatchTool(name, args) {
         switch (name) {
           // Document Management
           case 'get_document_info': return await this.getDocumentInfo();
@@ -907,119 +881,45 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
           case 'preflight_document': return await this.preflightDocument(args);
           case 'view_document': return await this.viewDocument();
           case 'zoom_to_page': return await this.zoomToPage(args);
-          case 'data_merge': return await this.dataMerge(args);
 
           default:
             throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
         }
-      } catch (error) {
-        throw new McpError(ErrorCode.InternalError, `Error executing tool ${name}: ${error.message}`);
-      }
-    });
   }
 
   // =================== CORE UTILITIES ===================
-  async executeAppleScript(script) {
-    // Security fix: Use temporary file instead of command line injection
-    const tempAppleScript = path.join(__dirname, `temp_applescript_${Date.now()}_${Math.random().toString(36).substring(2)}.scpt`);
-    
-    try {
-      // Write AppleScript to temporary file
-      fs.writeFileSync(tempAppleScript, script, 'utf8');
-      
-      // Execute via file (immune to injection)
-      const result = execSync(`osascript "${tempAppleScript}"`, {
-        encoding: 'utf8',
-        timeout: 30000,
-      });
-      
-      return result.trim();
-    } catch (error) {
-      throw new Error(`AppleScript execution failed: ${error.message}`);
-    } finally {
-      // Always cleanup temp file
-      if (fs.existsSync(tempAppleScript)) {
-        fs.unlinkSync(tempAppleScript);
-      }
-    }
-  }
-
   async executeInDesignScript(script) {
-    const tempScript = path.join(__dirname, 'temp_script.jsx');
-    const tempResult = path.join(__dirname, 'temp_result.txt');
-    
-    // Clean up any previous result file
-    if (fs.existsSync(tempResult)) {
-      fs.unlinkSync(tempResult);
-    }
-    
-    // Wrap script to capture return value via temp file
-    const resultPath = tempResult.replace(/\\/g, '/');
-    
-    // Auto-capture last expression: prepend __result__ = to last non-empty line
-    const lines = script.split('\n');
-    let lastExprIdx = -1;
-    for (let i = lines.length - 1; i >= 0; i--) {
-      const trimmed = lines[i].trim();
-      if (trimmed && !trimmed.startsWith('//') && !trimmed.startsWith('}')) {
-        lastExprIdx = i;
-        break;
+    const opening = ['create_document', 'open_document', 'execute_indesign_code'].includes(this.currentTool);
+    let expected;
+    if (!opening) {
+      const state = await this.bridge.execute('"";');
+      expected = state.document ?? { id: null, path: '' };
+      if (this.requestedDocument && (expected.id !== this.requestedDocument.id || expected.path !== this.requestedDocument.path)) {
+        throw new Error('Requested document identity/path is not active; no Data Merge mutation performed');
+      }
+      if (state.document) {
+        if (expected.path) {
+          this.files.validate(expected.path, { existing: true });
+          this.approvedPaths.push({ path: expected.path, directory: false });
+        }
+        else if (!this.unsavedDocuments.has(expected.id)) throw new Error('Unsaved active document was not created by this server; save it manually in an approved project or create a new document');
+        for (const link of expected.links) {
+          this.files.validate(link, { existing: true });
+          this.approvedPaths.push({ path: link, directory: false });
+        }
+        if (this.currentTool === 'save_document' && !expected.path && !/\bdoc\.save\(file\)/.test(script)) throw new Error('New documents require an explicit approved filePath');
+        if (this.currentTool === 'close_document' && !expected.path && /\bSaveOptions.YES\b/.test(script)) throw new Error('Save the new document to an explicit approved filePath before closing with save');
       }
     }
-    if (lastExprIdx >= 0) {
-      const lastLine = lines[lastExprIdx].trim();
-      // Don't prepend for statements that aren't expressions
-      if (!/^(var |let |const |if |for |while |switch |function |try |\/\/)/.test(lastLine)) {
-        lines[lastExprIdx] = 'var __result__ = ' + lines[lastExprIdx];
-      }
-    }
-    const processedScript = lines.join('\n');
-    
-    const wrappedScript = `
-      try {
-        ${processedScript}
-      } catch (error) {
-        var __result__ = "ERROR: " + error.message + " (Line: " + (error.line || "unknown") + ")";
-      }
-      if (typeof __result__ !== "undefined" && __result__ !== null) {
-        var __f__ = new File("${resultPath}");
-        __f__.encoding = "UTF-8";
-        __f__.open("w");
-        __f__.write(String(__result__));
-        __f__.close();
-      }
-    `;
-    
-    fs.writeFileSync(tempScript, wrappedScript);
-
-    try {
-      const appleScript = `
-        tell application "Adobe InDesign 2026"
-          activate
-          do script (POSIX file "${tempScript}") language javascript
-        end tell
-      `;
-      
-      await this.executeAppleScript(appleScript);
-      
-      // Read result from temp file
-      if (fs.existsSync(tempResult)) {
-        const result = fs.readFileSync(tempResult, 'utf8');
-        return result;
-      }
-      return "(no return value)";
-    } finally {
-      if (fs.existsSync(tempScript)) {
-        fs.unlinkSync(tempScript);
-      }
-      if (fs.existsSync(tempResult)) {
-        fs.unlinkSync(tempResult);
-      }
-    }
+    const result = await this.bridge.execute(script, expected, this.approvedPaths,
+      this.currentTool === 'export_data_merge_pdf' ? { timeoutMs: 120000 } : undefined);
+    if (['create_document', 'open_document'].includes(this.currentTool) && result.document && !result.document.path) this.unsavedDocuments.add(result.document.id);
+    return result.text;
   }
 
   formatResponse(result, operation = "Operation") {
     return {
+      isError: /^(Error\b|ERROR:|Invalid\b|No document\b|No text frame\b|File not found\b|Image file not found\b|Data source file not found\b)/i.test(result),
       content: [
         {
           type: 'text',
@@ -1159,13 +1059,13 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
     const { filePath } = args;
     
     // Security: Validate file path
-    const validatedPath = this.validateFilePath(filePath);
+    const validatedPath = this.validateFilePath(filePath, { existing: true });
     
     const script = `
       try {
-        var file = File("${validatedPath.replace(/\\/g, '\\\\')}");
+        var file = File(${jsxString(adobePath(validatedPath))});
         if (!file.exists) {
-          "File not found: ${validatedPath}";
+          ${jsxString('File not found: ' + validatedPath)};
         } else {
           var doc = app.open(file);
           "Document opened: " + doc.name + " (" + doc.pages.length + " pages)";
@@ -1197,7 +1097,7 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
         var doc = app.activeDocument;
         try {
           ${validatedPath ? `
-            var file = File("${validatedPath.replace(/\\/g, '\\\\')}");
+            var file = File(${jsxString(adobePath(validatedPath))});
             doc.save(file);
             "Document saved as: " + file.fsName;
           ` : `
@@ -1267,7 +1167,7 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
           `}
           
           ${masterPage ? `
-            var master = doc.masterSpreads.itemByName("${masterPage}");
+            var master = doc.masterSpreads.itemByName(${jsxString(masterPage)});
             if (master.isValid) {
               newPage.appliedMaster = master;
             }
@@ -1844,7 +1744,7 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
           
           if (textFrame) {
             // Convert markdown to formatted text
-            var markdownContent = \`${markdownText.replace(/`/g, '\\`').replace(/\$/g, '\\$')}\`;
+            var markdownContent = ${jsxString(markdownText)};
             
             ${replaceContent ? 'textFrame.contents = "";' : ''}
             
@@ -1857,7 +1757,7 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
               var line = lines[i];
               
               // Skip empty lines but add paragraph break
-              if (line.trim() === '') {
+              if (line.replace(/^\\s+|\\s+$/g, '') === '') {
                 if (i < lines.length - 1) {
                   insertionPoint.contents = '\\r';
                   insertionPoint = story.insertionPoints[-1];
@@ -2073,7 +1973,12 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
               var beforeQuotes = (story.contents.match(/"/g) || []).length;
               if (beforeQuotes > 0) {
                 // Simple quote replacement (could be enhanced)
-                story.contents = story.contents.replace(/"/g, "„").replace(/„/g, """).replace(/"/g, "„");
+                var openingQuote = true;
+                story.contents = story.contents.replace(/"/g, function () {
+                  var quote = openingQuote ? "\\u201e" : "\\u201c";
+                  openingQuote = !openingQuote;
+                  return quote;
+                });
                 changeLog += "Fixed " + Math.floor(beforeQuotes/2) + " quote pair(s)\\n";
                 changes += Math.floor(beforeQuotes/2);
               }
@@ -2653,17 +2558,17 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
             textFrame.geometricBounds = ["${y}mm", "${x}mm", "${y + height}mm", "${x + width}mm"];
             
             // Add content
-            textFrame.contents = "${content.replace(/"/g, '\\"').replace(/\n/g, '\\n')}";
+            textFrame.contents = ${jsxString(content)};
             
             // Apply formatting
             var story = textFrame.parentStory;
             
             // Font and size
             try {
-              story.characters.everyItem().appliedFont = app.fonts.itemByName("${fontFamily}\\t${fontStyle}");
+              story.characters.everyItem().appliedFont = app.fonts.itemByName(${jsxString(fontFamily + '\t' + fontStyle)});
             } catch (e) {
               try {
-                story.characters.everyItem().appliedFont = app.fonts.itemByName("${fontFamily}");
+                story.characters.everyItem().appliedFont = app.fonts.itemByName(${jsxString(fontFamily)});
               } catch (e2) {
                 // Use default font
               }
@@ -2673,7 +2578,7 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
             
             // Color
             try {
-              story.characters.everyItem().fillColor = doc.swatches.itemByName("${textColor}");
+              story.characters.everyItem().fillColor = doc.swatches.itemByName(${jsxString(textColor)});
             } catch (e) {
               // Use default color
             }
@@ -2684,7 +2589,7 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
             // Apply styles if specified
             ${paragraphStyle ? `
               try {
-                var pStyle = doc.paragraphStyles.itemByName("${paragraphStyle}");
+                var pStyle = doc.paragraphStyles.itemByName(${jsxString(paragraphStyle)});
                 if (pStyle.isValid) {
                   story.paragraphs.everyItem().appliedParagraphStyle = pStyle;
                 }
@@ -2693,14 +2598,14 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
             
             ${characterStyle ? `
               try {
-                var cStyle = doc.characterStyles.itemByName("${characterStyle}");
+                var cStyle = doc.characterStyles.itemByName(${jsxString(characterStyle)});
                 if (cStyle.isValid) {
                   story.characters.everyItem().appliedCharacterStyle = cStyle;
                 }
               } catch (e) {}
             ` : ''}
             
-            "Text frame created on page " + (${pageIndex} + 1) + " with content: " + "${content.substring(0, 50)}${content.length > 50 ? '...' : ''}";
+            "Text frame created on page " + (${pageIndex} + 1) + " with content: " + ${jsxString(content.substring(0, 50) + (content.length > 50 ? '...' : ''))};
           }
         } catch (e) {
           "Error creating text frame: " + e.message;
@@ -2728,16 +2633,16 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
             var textFrame = page.textFrames[${frameIndex}];
             var story = textFrame.parentStory;
             
-            ${content !== undefined ? `textFrame.contents = "${content.replace(/"/g, '\\"').replace(/\n/g, '\\n')}";` : ''}
+            ${content !== undefined ? `textFrame.contents = ${jsxString(content)};` : ''}
             ${fontSize !== undefined ? `story.characters.everyItem().pointSize = ${fontSize};` : ''}
             ${fontFamily !== undefined ? `
               try {
-                story.characters.everyItem().appliedFont = app.fonts.itemByName("${fontFamily}");
+                story.characters.everyItem().appliedFont = app.fonts.itemByName(${jsxString(fontFamily)});
               } catch (e) {}
             ` : ''}
             ${textColor !== undefined ? `
               try {
-                story.characters.everyItem().fillColor = doc.swatches.itemByName("${textColor}");
+                story.characters.everyItem().fillColor = doc.swatches.itemByName(${jsxString(textColor)});
               } catch (e) {}
             ` : ''}
             ${alignment !== undefined ? `story.paragraphs.everyItem().justification = Justification.${alignment};` : ''}
@@ -2769,11 +2674,11 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
           
           // Set find preferences
           ${useGrep ? `
-            app.findGrepPreferences.findWhat = "${findText.replace(/"/g, '\\"')}";
-            app.changeGrepPreferences.changeTo = "${replaceText.replace(/"/g, '\\"')}";
+            app.findGrepPreferences.findWhat = ${jsxString(findText)};
+            app.changeGrepPreferences.changeTo = ${jsxString(replaceText)};
           ` : `
-            app.findTextPreferences.findWhat = "${findText.replace(/"/g, '\\"')}";
-            app.changeTextPreferences.changeTo = "${replaceText.replace(/"/g, '\\"')}";
+            app.findTextPreferences.findWhat = ${jsxString(findText)};
+            app.changeTextPreferences.changeTo = ${jsxString(replaceText)};
             app.findTextPreferences.caseSensitive = ${caseSensitive};
             app.findTextPreferences.wholeWord = ${wholeWord};
           `}
@@ -2796,7 +2701,7 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
           app.findGrepPreferences = NothingEnum.nothing;
           app.changeGrepPreferences = NothingEnum.nothing;
           
-          "Found and replaced " + changeCount + " instances of '" + "${findText}" + "' with '" + "${replaceText}" + "'";
+          "Found and replaced " + changeCount + " instances of '" + ${jsxString(findText)} + "' with '" + ${jsxString(replaceText)} + "'";
         } catch (e) {
           "Error in find/replace: " + e.message;
         }
@@ -2812,7 +2717,7 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
     const { imagePath, x = 10, y = 10, width, height, pageIndex = 0, fitOption = 'PROPORTIONALLY', createFrame = true } = args;
 
     // Security: Validate image path
-    const validatedPath = this.validateFilePath(imagePath);
+    const validatedPath = this.validateFilePath(imagePath, { existing: true });
 
     const script = `
       if (app.documents.length === 0) {
@@ -2821,10 +2726,10 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
         var doc = app.activeDocument;
         try {
           var page = doc.pages[${pageIndex}];
-          var imageFile = File("${validatedPath.replace(/\\/g, '\\\\')}");
+          var imageFile = File(${jsxString(adobePath(validatedPath))});
           
           if (!imageFile.exists) {
-            "Image file not found: ${validatedPath}";
+            ${jsxString('Image file not found: ' + validatedPath)};
           } else {
             ${createFrame ? `
               var rect = page.rectangles.add();
@@ -2887,12 +2792,12 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
           
           ${fillColor ? `
             try {
-              rect.fillColor = doc.swatches.itemByName("${fillColor}");
+              rect.fillColor = doc.swatches.itemByName(${jsxString(fillColor)});
             } catch (e) {
               // Try to create color if it doesn't exist
               try {
                 var newSwatch = doc.colors.add();
-                newSwatch.name = "${fillColor}";
+                newSwatch.name = ${jsxString(fillColor)};
                 rect.fillColor = newSwatch;
               } catch (e2) {}
             }
@@ -2900,7 +2805,7 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
           
           ${strokeColor ? `
             try {
-              rect.strokeColor = doc.swatches.itemByName("${strokeColor}");
+              rect.strokeColor = doc.swatches.itemByName(${jsxString(strokeColor)});
               rect.strokeWeight = "${strokeWidth}pt";
             } catch (e) {}
           ` : ''}
@@ -2932,13 +2837,13 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
           
           ${fillColor ? `
             try {
-              ellipse.fillColor = doc.swatches.itemByName("${fillColor}");
+              ellipse.fillColor = doc.swatches.itemByName(${jsxString(fillColor)});
             } catch (e) {}
           ` : ''}
           
           ${strokeColor ? `
             try {
-              ellipse.strokeColor = doc.swatches.itemByName("${strokeColor}");
+              ellipse.strokeColor = doc.swatches.itemByName(${jsxString(strokeColor)});
               ellipse.strokeWeight = "${strokeWidth}pt";
             } catch (e) {}
           ` : ''}
@@ -2965,11 +2870,11 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
         var doc = app.activeDocument;
         try {
           var pStyle = doc.paragraphStyles.add();
-          pStyle.name = "${name}";
+          pStyle.name = ${jsxString(name)};
           
           ${baseStyle ? `
             try {
-              var base = doc.paragraphStyles.itemByName("${baseStyle}");
+              var base = doc.paragraphStyles.itemByName(${jsxString(baseStyle)});
               if (base.isValid) {
                 pStyle.basedOn = base;
               }
@@ -2978,7 +2883,7 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
           
           ${fontFamily ? `
             try {
-              pStyle.appliedFont = app.fonts.itemByName("${fontFamily}");
+              pStyle.appliedFont = app.fonts.itemByName(${jsxString(fontFamily)});
             } catch (e) {}
           ` : ''}
           
@@ -2990,11 +2895,11 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
           
           ${textColor ? `
             try {
-              pStyle.fillColor = doc.swatches.itemByName("${textColor}");
+              pStyle.fillColor = doc.swatches.itemByName(${jsxString(textColor)});
             } catch (e) {}
           ` : ''}
           
-          "Paragraph style '${name}' created successfully";
+          ${jsxString("Paragraph style '" + name + "' created successfully")};
         } catch (e) {
           "Error creating paragraph style: " + e.message;
         }
@@ -3015,11 +2920,11 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
         var doc = app.activeDocument;
         try {
           var cStyle = doc.characterStyles.add();
-          cStyle.name = "${name}";
+          cStyle.name = ${jsxString(name)};
           
           ${baseStyle ? `
             try {
-              var base = doc.characterStyles.itemByName("${baseStyle}");
+              var base = doc.characterStyles.itemByName(${jsxString(baseStyle)});
               if (base.isValid) {
                 cStyle.basedOn = base;
               }
@@ -3029,9 +2934,9 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
           ${fontFamily ? `
             try {
               ${fontStyle ? `
-                cStyle.appliedFont = app.fonts.itemByName("${fontFamily}\\t${fontStyle}");
+                cStyle.appliedFont = app.fonts.itemByName(${jsxString(fontFamily + '\t' + fontStyle)});
               ` : `
-                cStyle.appliedFont = app.fonts.itemByName("${fontFamily}");
+                cStyle.appliedFont = app.fonts.itemByName(${jsxString(fontFamily)});
               `}
             } catch (e) {}
           ` : ''}
@@ -3041,11 +2946,11 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
           
           ${textColor ? `
             try {
-              cStyle.fillColor = doc.swatches.itemByName("${textColor}");
+              cStyle.fillColor = doc.swatches.itemByName(${jsxString(textColor)});
             } catch (e) {}
           ` : ''}
           
-          "Character style '${name}' created successfully";
+          ${jsxString("Character style '" + name + "' created successfully")};
         } catch (e) {
           "Error creating character style: " + e.message;
         }
@@ -3066,20 +2971,20 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
         var doc = app.activeDocument;
         try {
           // Find the character style
-          var cStyle = doc.characterStyles.itemByName("${styleName}");
+          var cStyle = doc.characterStyles.itemByName(${jsxString(styleName)});
           if (!cStyle.isValid) {
-            "Character style '${styleName}' not found";
+            ${jsxString("Character style '" + styleName + "' not found")};
           } else {
             var changes = [];
             
             ${fontFamily ? `
-              cStyle.appliedFont = "${fontFamily}";
-              changes.push("Font Family: ${fontFamily}");
+              cStyle.appliedFont = ${jsxString(fontFamily)};
+              changes.push(${jsxString('Font Family: ' + fontFamily)});
             ` : ''}
             
             ${fontStyle ? `
-              cStyle.fontStyle = "${fontStyle}";
-              changes.push("Font Style: ${fontStyle}");
+              cStyle.fontStyle = ${jsxString(fontStyle)};
+              changes.push(${jsxString('Font Style: ' + fontStyle)});
             ` : ''}
             
             ${fontSize ? `
@@ -3089,15 +2994,15 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
             
             ${textColor ? `
               try {
-                var colorSwatch = doc.colors.itemByName("${textColor}");
+                var colorSwatch = doc.colors.itemByName(${jsxString(textColor)});
                 if (colorSwatch.isValid) {
                   cStyle.fillColor = colorSwatch;
-                  changes.push("Text Color: ${textColor}");
+                  changes.push(${jsxString('Text Color: ' + textColor)});
                 } else {
-                  changes.push("Warning: Color '${textColor}' not found");
+                  changes.push(${jsxString("Warning: Color '" + textColor + "' not found")});
                 }
               } catch (e) {
-                changes.push("Warning: Could not apply color '${textColor}': " + e.message);
+                changes.push(${jsxString("Warning: Could not apply color '" + textColor + "': ")} + e.message);
               }
             ` : ''}
             
@@ -3107,9 +3012,9 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
             ` : ''}
             
             if (changes.length > 0) {
-              "Character style '${styleName}' modified:\\n" + changes.join("\\n");
+              ${jsxString("Character style '" + styleName + "' modified:\n")} + changes.join("\\n");
             } else {
-              "No properties specified to modify for character style '${styleName}'";
+              ${jsxString("No properties specified to modify for character style '" + styleName + "'")};
             }
           }
         } catch (e) {
@@ -3132,15 +3037,15 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
         var doc = app.activeDocument;
         try {
           // Find the paragraph style
-          var pStyle = doc.paragraphStyles.itemByName("${styleName}");
+          var pStyle = doc.paragraphStyles.itemByName(${jsxString(styleName)});
           if (!pStyle.isValid) {
-            "Paragraph style '${styleName}' not found";
+            ${jsxString("Paragraph style '" + styleName + "' not found")};
           } else {
             var changes = [];
             
             ${fontFamily ? `
-              pStyle.appliedFont = "${fontFamily}";
-              changes.push("Font Family: ${fontFamily}");
+              pStyle.appliedFont = ${jsxString(fontFamily)};
+              changes.push(${jsxString('Font Family: ' + fontFamily)});
             ` : ''}
             
             ${fontSize ? `
@@ -3170,22 +3075,22 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
             
             ${textColor ? `
               try {
-                var colorSwatch = doc.colors.itemByName("${textColor}");
+                var colorSwatch = doc.colors.itemByName(${jsxString(textColor)});
                 if (colorSwatch.isValid) {
                   pStyle.fillColor = colorSwatch;
-                  changes.push("Text Color: ${textColor}");
+                  changes.push(${jsxString('Text Color: ' + textColor)});
                 } else {
-                  changes.push("Warning: Color '${textColor}' not found");
+                  changes.push(${jsxString("Warning: Color '" + textColor + "' not found")});
                 }
               } catch (e) {
-                changes.push("Warning: Could not apply color '${textColor}': " + e.message);
+                changes.push(${jsxString("Warning: Could not apply color '" + textColor + "': ")} + e.message);
               }
             ` : ''}
             
             if (changes.length > 0) {
-              "Paragraph style '${styleName}' modified:\\n" + changes.join("\\n");
+              ${jsxString("Paragraph style '" + styleName + "' modified:\n")} + changes.join("\\n");
             } else {
-              "No properties specified to modify for paragraph style '${styleName}'";
+              ${jsxString("No properties specified to modify for paragraph style '" + styleName + "'")};
             }
           }
         } catch (e) {
@@ -3208,37 +3113,37 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
         var doc = app.activeDocument;
         try {
           // Find the object style
-          var oStyle = doc.objectStyles.itemByName("${styleName}");
+          var oStyle = doc.objectStyles.itemByName(${jsxString(styleName)});
           if (!oStyle.isValid) {
-            "Object style '${styleName}' not found";
+            ${jsxString("Object style '" + styleName + "' not found")};
           } else {
             var changes = [];
             
             ${fillColor ? `
               try {
-                var fillSwatch = doc.colors.itemByName("${fillColor}");
+                var fillSwatch = doc.colors.itemByName(${jsxString(fillColor)});
                 if (fillSwatch.isValid) {
                   oStyle.fillColor = fillSwatch;
-                  changes.push("Fill Color: ${fillColor}");
+                  changes.push(${jsxString('Fill Color: ' + fillColor)});
                 } else {
-                  changes.push("Warning: Fill color '${fillColor}' not found");
+                  changes.push(${jsxString("Warning: Fill color '" + fillColor + "' not found")});
                 }
               } catch (e) {
-                changes.push("Warning: Could not apply fill color '${fillColor}': " + e.message);
+                changes.push(${jsxString("Warning: Could not apply fill color '" + fillColor + "': ")} + e.message);
               }
             ` : ''}
             
             ${strokeColor ? `
               try {
-                var strokeSwatch = doc.colors.itemByName("${strokeColor}");
+                var strokeSwatch = doc.colors.itemByName(${jsxString(strokeColor)});
                 if (strokeSwatch.isValid) {
                   oStyle.strokeColor = strokeSwatch;
-                  changes.push("Stroke Color: ${strokeColor}");
+                  changes.push(${jsxString('Stroke Color: ' + strokeColor)});
                 } else {
-                  changes.push("Warning: Stroke color '${strokeColor}' not found");
+                  changes.push(${jsxString("Warning: Stroke color '" + strokeColor + "' not found")});
                 }
               } catch (e) {
-                changes.push("Warning: Could not apply stroke color '${strokeColor}': " + e.message);
+                changes.push(${jsxString("Warning: Could not apply stroke color '" + strokeColor + "': ")} + e.message);
               }
             ` : ''}
             
@@ -3253,9 +3158,9 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
             ` : ''}
             
             if (changes.length > 0) {
-              "Object style '${styleName}' modified:\\n" + changes.join("\\n");
+              ${jsxString("Object style '" + styleName + "' modified:\n")} + changes.join("\\n");
             } else {
-              "No properties specified to modify for object style '${styleName}'";
+              ${jsxString("No properties specified to modify for object style '" + styleName + "'")};
             }
           }
         } catch (e) {
@@ -3278,11 +3183,11 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
         var doc = app.activeDocument;
         try {
           var oStyle = doc.objectStyles.add();
-          oStyle.name = "${name}";
+          oStyle.name = ${jsxString(name)};
           
           ${baseStyle ? `
             try {
-              var base = doc.objectStyles.itemByName("${baseStyle}");
+              var base = doc.objectStyles.itemByName(${jsxString(baseStyle)});
               if (base.isValid) {
                 oStyle.basedOn = base;
               }
@@ -3291,7 +3196,7 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
           
           ${fillColor ? `
             try {
-              var fillSwatch = doc.colors.itemByName("${fillColor}");
+              var fillSwatch = doc.colors.itemByName(${jsxString(fillColor)});
               if (fillSwatch.isValid) {
                 oStyle.fillColor = fillSwatch;
               }
@@ -3300,7 +3205,7 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
           
           ${strokeColor ? `
             try {
-              var strokeSwatch = doc.colors.itemByName("${strokeColor}");
+              var strokeSwatch = doc.colors.itemByName(${jsxString(strokeColor)});
               if (strokeSwatch.isValid) {
                 oStyle.strokeColor = strokeSwatch;
               }
@@ -3335,9 +3240,9 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
       } else {
         var doc = app.activeDocument;
         try {
-          var oStyle = doc.objectStyles.itemByName("${styleName}");
+          var oStyle = doc.objectStyles.itemByName(${jsxString(styleName)});
           if (!oStyle.isValid) {
-            "Object style '${styleName}' not found";
+            ${jsxString("Object style '" + styleName + "' not found")};
           } else {
             var objectsToStyle = [];
             
@@ -3369,7 +3274,7 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
                   }
                 } catch (e) {}
               }
-              "Object style '${styleName}' applied to " + appliedCount + " object(s)";
+              ${jsxString("Object style '" + styleName + "' applied to ")} + appliedCount + " object(s)";
             }
           }
         } catch (e) {
@@ -3393,10 +3298,10 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
         try {
           var page = doc.pages[${pageIndex}];
           var textFrame = page.textFrames[${frameIndex}];
-          var style = doc.paragraphStyles.itemByName("${styleName}");
+          var style = doc.paragraphStyles.itemByName(${jsxString(styleName)});
           
           if (!style.isValid) {
-            "Paragraph style '${styleName}' not found";
+            ${jsxString("Paragraph style '" + styleName + "' not found")};
           } else {
             ${startIndex !== undefined && endIndex !== undefined ? `
               var textRange = textFrame.parentStory.characters.itemByRange(${startIndex}, ${endIndex});
@@ -3405,7 +3310,7 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
               textFrame.parentStory.paragraphs.everyItem().appliedParagraphStyle = style;
             `}
             
-            "Paragraph style '${styleName}' applied to text frame ${frameIndex}";
+            ${jsxString("Paragraph style '" + styleName + "' applied to text frame " + frameIndex)};
           }
         } catch (e) {
           "Error applying paragraph style: " + e.message;
@@ -3470,21 +3375,13 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
         try {
           var newColor;
           
-          if ("${colorModel}" === "CMYK") {
-            newColor = doc.colors.add();
-            newColor.name = "${name}";
-            newColor.model = ColorModel.SPOT;
-            newColor.colorValue = [${colorValues.join(', ')}];
-            ${spotColor ? `newColor.model = ColorModel.SPOT;` : `newColor.model = ColorModel.PROCESS;`}
-          } else if ("${colorModel}" === "RGB") {
-            newColor = doc.colors.add();
-            newColor.name = "${name}";
-            newColor.model = ColorModel.PROCESS;
-            newColor.space = ColorSpace.RGB;
-            newColor.colorValue = [${colorValues.join(', ')}];
-          }
+          newColor = doc.colors.add();
+          newColor.name = ${jsxString(name)};
+          newColor.model = ${spotColor ? 'ColorModel.SPOT' : 'ColorModel.PROCESS'};
+          newColor.space = ColorSpace.${colorModel};
+          newColor.colorValue = ${jsxLiteral(colorValues)};
           
-          "Color swatch '${name}' created (${colorModel}: ${colorValues.join(', ')})";
+          ${jsxString("Color swatch '" + name + "' created (" + colorModel + ': ' + colorValues.join(', ') + ')')};
         } catch (e) {
           "Error creating color swatch: " + e.message;
         }
@@ -3537,10 +3434,10 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
         try {
           var page = doc.pages[${pageIndex}];
           var pageItem = page.allPageItems[${objectIndex}];
-          var swatch = doc.swatches.itemByName("${swatchName}");
+          var swatch = doc.swatches.itemByName(${jsxString(swatchName)});
           
           if (!swatch.isValid) {
-            "Color swatch '${swatchName}' not found";
+            ${jsxString("Color swatch '" + swatchName + "' not found")};
           } else {
             if ("${property}" === "fill") {
               pageItem.fillColor = swatch;
@@ -3548,7 +3445,7 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
               pageItem.strokeColor = swatch;
             }
             
-            "Color '${swatchName}' applied to ${property} of object ${objectIndex}";
+            ${jsxString("Color '" + swatchName + "' applied to " + property + ' of object ' + objectIndex)};
           }
         } catch (e) {
           "Error applying color: " + e.message;
@@ -3570,49 +3467,54 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
     // Security: Validate file path
     const validatedPath = this.validateFilePath(filePath);
 
+    const presetName = {
+      Print: 'High Quality Print',
+      Web: 'Smallest File Size',
+      SmallestFileSize: 'Smallest File Size',
+      HighQualityPrint: 'High Quality Print',
+      PressQuality: 'Press Quality',
+    }[preset];
     const script = `
       if (app.documents.length === 0) {
         "No document open. Please create a document first.";
       } else {
         var doc = app.activeDocument;
         try {
-          var pdfFile = File("${validatedPath.replace(/\\/g, '\\\\')}");
-          var pdfPreset;
-          
-          // Try to get the specified preset
+          var pdfFile = File(${jsxString(adobePath(validatedPath))});
+          var pdfPreset = app.pdfExportPresets.itemByName(${jsxString('[' + presetName + ']')});
+          if (!pdfPreset.isValid) pdfPreset = app.pdfExportPresets.itemByName(${jsxString(presetName)});
+          if (!pdfPreset.isValid) throw new Error(${jsxString('Required PDF preset is not installed: ' + presetName)});
+          var preferences = app.pdfExportPreferences;
+          var oldRange = preferences.pageRange;
+          var oldView = preferences.viewPDF;
+          var temporaryPreset;
           try {
-            pdfPreset = app.pdfExportPresets.itemByName("[${preset}]");
-          } catch (e) {
-            pdfPreset = app.pdfExportPresets[0]; // Use first available preset
+            temporaryPreset = pdfPreset.duplicate();
+            temporaryPreset.useDocumentBleedWithPDF = ${includeBleed};
+            ${!includeBleed ? `
+              temporaryPreset.bleedTop = 0;
+              temporaryPreset.bleedBottom = 0;
+              temporaryPreset.bleedInside = 0;
+              temporaryPreset.bleedOutside = 0;
+            ` : ''}
+            temporaryPreset.includeSlugWithPDF = ${includeSlug};
+            temporaryPreset.exportReaderSpreads = false;
+            temporaryPreset.exportAsSinglePages = false;
+            temporaryPreset.colorBitmapQuality = CompressionQuality.${jpegQuality.toUpperCase()};
+            temporaryPreset.grayscaleBitmapQuality = CompressionQuality.${jpegQuality.toUpperCase()};
+            ${colorProfile ? `temporaryPreset.pdfDestinationProfile = ${jsxString(colorProfile)};` : ''}
+            preferences.pageRange = ${pageRange === 'all' ? 'PageRange.ALL_PAGES' : jsxString(pageRange)};
+            preferences.viewPDF = false;
+            doc.exportFile(ExportFormat.PDF_TYPE, pdfFile, false, temporaryPreset);
+          } finally {
+            try {
+              if (temporaryPreset && temporaryPreset.isValid) temporaryPreset.remove();
+            } finally {
+              preferences.pageRange = oldRange;
+              preferences.viewPDF = oldView;
+            }
           }
-          
-          // Customize export preferences
-          ${pageRange !== 'all' ? `
-            app.pdfExportPreferences.pageRange = "${pageRange}";
-          ` : `
-            app.pdfExportPreferences.pageRange = PageRange.ALL_PAGES;
-          `}
-          
-          app.pdfExportPreferences.includeBleedMarks = ${includeBleed};
-          app.pdfExportPreferences.includeSlugArea = ${includeSlug};
-          
-          ${colorProfile ? `
-            app.pdfExportPreferences.outputIntention = OutputIntention.REPURPOSE;
-          ` : ''}
-          
-          // Set JPEG quality
-          if ("${jpegQuality}" === "Low") {
-            app.pdfExportPreferences.jpegQuality = JPEGOptionsQuality.LOW;
-          } else if ("${jpegQuality}" === "Medium") {
-            app.pdfExportPreferences.jpegQuality = JPEGOptionsQuality.MEDIUM;
-          } else if ("${jpegQuality}" === "High") {
-            app.pdfExportPreferences.jpegQuality = JPEGOptionsQuality.HIGH;
-          } else if ("${jpegQuality}" === "Maximum") {
-            app.pdfExportPreferences.jpegQuality = JPEGOptionsQuality.MAXIMUM;
-          }
-          
-          doc.exportFile(ExportFormat.PDF_TYPE, pdfFile, false, pdfPreset);
-          "PDF exported successfully to: ${filePath}";
+          ${jsxString('PDF exported successfully to: ' + filePath)};
         } catch (e) {
           "Error exporting PDF: " + e.message;
         }
@@ -3630,7 +3532,7 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
     this.validateDestructiveOperation(args, 'EXPORT IMAGES', folderPath);
 
     // Security: Validate folder path
-    const validatedPath = this.validateFilePath(folderPath);
+    const validatedPath = this.validateFilePath(folderPath, { existing: true, directory: true });
 
     const script = `
       if (app.documents.length === 0) {
@@ -3638,7 +3540,7 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
       } else {
         var doc = app.activeDocument;
         try {
-          var exportFolder = Folder("${validatedPath.replace(/\\/g, '\\\\')}");
+          var exportFolder = Folder(${jsxString(adobePath(validatedPath))});
           if (!exportFolder.exists) {
             exportFolder.create();
           }
@@ -3671,7 +3573,7 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
             }
           ` : `
             // Parse page range (simplified)
-            var pageNumbers = "${pageRange}".split("-");
+            var pageNumbers = ${jsxString(pageRange)}.split("-");
             var startPage = parseInt(pageNumbers[0]) - 1;
             var endPage = pageNumbers.length > 1 ? parseInt(pageNumbers[1]) - 1 : startPage;
             
@@ -3682,13 +3584,13 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
           
           for (var i = 0; i < pages.length; i++) {
             var page = pages[i];
-            var fileName = doc.name.replace(/\.indd$/i, "") + "_page" + (page.documentOffset + 1) + fileExtension;
+            var fileName = "page_" + (page.documentOffset + 1) + fileExtension;
             var exportFile = File(exportFolder + "/" + fileName);
             
             page.exportFile(exportFormat, exportFile);
           }
           
-          "Exported " + pages.length + " pages as ${format} files to: ${folderPath}";
+          "Exported " + pages.length + ${jsxString(' pages as ' + format + ' files to: ' + folderPath)};
         } catch (e) {
           "Error exporting images: " + e.message;
         }
@@ -3714,7 +3616,7 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
       } else {
         var doc = app.activeDocument;
         try {
-          var epubFile = File("${validatedPath.replace(/\\/g, '\\\\')}");
+          var epubFile = File(${jsxString(adobePath(validatedPath))});
           
           // Set EPUB export preferences
           var epubExportPrefs = app.epubExportPreferences;
@@ -3733,7 +3635,7 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
           `}
           
           doc.exportFile(ExportFormat.EPUB, epubFile);
-          "EPUB exported successfully to: ${validatedPath}";
+          ${jsxString('EPUB exported successfully to: ' + validatedPath)};
         } catch (e) {
           "Error exporting EPUB: " + e.message;
         }
@@ -3751,7 +3653,7 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
     this.validateDestructiveOperation(args, 'PACKAGE DOCUMENT', folderPath);
 
     // Security: Validate folder path
-    const validatedPath = this.validateFilePath(folderPath);
+    const validatedPath = this.validateFilePath(folderPath, { existing: true, directory: true });
 
     const script = `
       if (app.documents.length === 0) {
@@ -3759,11 +3661,11 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
       } else {
         var doc = app.activeDocument;
         try {
-          var packageFolder = Folder("${validatedPath.replace(/\\/g, '\\\\')}");
+          var packageFolder = Folder(${jsxString(adobePath(validatedPath))});
           
           doc.packageForPrint(packageFolder, ${includeLinkedFiles}, ${includeFonts}, true, ${createReport}, "Package created by InDesign MCP Server");
           
-          "Document packaged successfully to: ${folderPath}";
+          ${jsxString('Document packaged successfully to: ' + folderPath)};
         } catch (e) {
           "Error packaging document: " + e.message;
         }
@@ -3779,8 +3681,8 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
     const code = (typeof args === 'string') ? args : args.code;
     
     // Security: Check if arbitrary code execution is allowed
-    const allowArbitraryCode = process.env.INDESIGN_ALLOW_ARBITRARY_CODE;
-    if (!allowArbitraryCode || allowArbitraryCode === '0' || allowArbitraryCode.toLowerCase() === 'false') {
+    const allowArbitraryCode = this.env.INDESIGN_ALLOW_ARBITRARY_CODE;
+    if (allowArbitraryCode !== '1') {
       throw new McpError(
         ErrorCode.InvalidRequest,
         `Arbitrary code execution is disabled for security reasons.
@@ -3892,7 +3794,7 @@ Usage: INDESIGN_ALLOW_ARBITRARY_CODE=1 node index.js`
             "Table index ${tableIndex} not found. Page has " + tables.length + " tables.";
           } else {
             var table = tables[${tableIndex}];
-            var tableData = ${JSON.stringify(data)};
+            var tableData = ${jsxLiteral(data)};
             
             for (var row = 0; row < tableData.length && row < table.rowCount; row++) {
               for (var col = 0; col < tableData[row].length && col < table.columnCount; col++) {
@@ -3923,7 +3825,7 @@ Usage: INDESIGN_ALLOW_ARBITRARY_CODE=1 node index.js`
         var doc = app.activeDocument;
         try {
           var layer = doc.layers.add();
-          layer.name = "${name}";
+          layer.name = ${jsxString(name)};
           layer.visible = ${visible};
           layer.locked = ${locked};
           
@@ -3933,7 +3835,7 @@ Usage: INDESIGN_ALLOW_ARBITRARY_CODE=1 node index.js`
             } catch (e) {}
           ` : ''}
           
-          "Layer '${name}' created successfully";
+          ${jsxString("Layer '" + name + "' created successfully")};
         } catch (e) {
           "Error creating layer: " + e.message;
         }
@@ -3953,12 +3855,12 @@ Usage: INDESIGN_ALLOW_ARBITRARY_CODE=1 node index.js`
       } else {
         var doc = app.activeDocument;
         try {
-          var layer = doc.layers.itemByName("${layerName}");
+          var layer = doc.layers.itemByName(${jsxString(layerName)});
           if (layer.isValid) {
             doc.activeLayer = layer;
-            "Active layer set to: ${layerName}";
+            ${jsxString('Active layer set to: ' + layerName)};
           } else {
-            "Layer '${layerName}' not found";
+            ${jsxString("Layer '" + layerName + "' not found")};
           }
         } catch (e) {
           "Error setting active layer: " + e.message;
@@ -4009,7 +3911,7 @@ Usage: INDESIGN_ALLOW_ARBITRARY_CODE=1 node index.js`
           var preflightProfile;
           
           ${profile ? `
-            preflightProfile = app.preflightProfiles.itemByName("${profile}");
+            preflightProfile = app.preflightProfiles.itemByName(${jsxString(profile)});
             if (!preflightProfile.isValid) {
               preflightProfile = app.preflightProfiles[0];
             }
@@ -4071,57 +3973,6 @@ Usage: INDESIGN_ALLOW_ARBITRARY_CODE=1 node index.js`
     return this.formatResponse(result, "Zoom to Page");
   }
 
-  async dataMerge(args) {
-    const { dataSourcePath, outputFolder, fileFormat = 'PDF', recordRange = 'all' } = args;
-
-    // Security: Require confirmation for bulk file creation
-    this.validateDestructiveOperation(args, 'DATA MERGE', `${outputFolder} (will create multiple files)`);
-
-    // Security: Validate both data source and output paths
-    const validatedDataSource = this.validateFilePath(dataSourcePath);
-    const validatedOutputFolder = this.validateFilePath(outputFolder);
-
-    const script = `
-      if (app.documents.length === 0) {
-        "No document open";
-      } else {
-        var doc = app.activeDocument;
-        try {
-          var dataSource = File("${validatedDataSource.replace(/\\/g, '\\\\')}");
-          if (!dataSource.exists) {
-            "Data source file not found: ${validatedDataSource}";
-          } else {
-            // Set up data merge
-            doc.dataMergeProperties.dataMergeSource = dataSource;
-            
-            var outputDir = Folder("${validatedOutputFolder.replace(/\\/g, '\\\\')}");
-            if (!outputDir.exists) {
-              outputDir.create();
-            }
-            
-            // Export merged documents
-            ${recordRange === 'all' ? `
-              doc.dataMergeProperties.exportRecords(RecordsToMerge.ALL_RECORDS, outputDir, true);
-            ` : `
-              // Parse record range
-              var ranges = "${recordRange}".split("-");
-              var startRecord = parseInt(ranges[0]);
-              var endRecord = ranges.length > 1 ? parseInt(ranges[1]) : startRecord;
-              doc.dataMergeProperties.exportRecords(RecordsToMerge.RANGE, outputDir, true, startRecord, endRecord);
-            `}
-            
-            "Data merge completed. Files saved to: ${validatedOutputFolder}";
-          }
-        } catch (e) {
-          "Error in data merge: " + e.message;
-        }
-      }
-    `;
-
-    const result = await this.executeInDesignScript(script);
-    return this.formatResponse(result, "Data Merge");
-  }
-
   async run() {
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
@@ -4129,5 +3980,10 @@ Usage: INDESIGN_ALLOW_ARBITRARY_CODE=1 node index.js`
   }
 }
 
-const server = new InDesignMCPServer();
-server.run().catch(console.error);
+if (process.argv[1] && path.resolve(process.argv[1]) === __filename) {
+  const server = new InDesignMCPServer();
+  server.run().catch(error => {
+    console.error(error);
+    process.exitCode = 1;
+  });
+}

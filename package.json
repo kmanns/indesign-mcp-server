@@ -6,7 +6,10 @@
   "type": "module",
   "scripts": {
     "start": "node index.js",
-    "dev": "node --inspect index.js"
+    "dev": "node --inspect index.js",
+    "test": "node --test test/*.test.js",
+    "test:live": "node test/live-smoke.js",
+    "check": "node --check index.js && node --check security.js && node --check bridge.js && node --check data-merge.js"
   },
   "keywords": [
     "mcp",
@@ -21,10 +24,15 @@
   "author": "lucdesign",
   "license": "MIT",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^0.5.0"
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "ajv": "8.20.0",
+    "csv-parse": "6.1.0"
+  },
+  "devDependencies": {
+    "acorn": "8.15.0"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=22.0.0"
   },
   "repository": {
     "type": "git",
