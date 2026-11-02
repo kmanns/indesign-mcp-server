@@ -2,6 +2,24 @@
 
 ## Enhanced Features for Better Claude Integration
 
+Read [README.md](README.md#security-and-compatibility) before using these examples.
+The same rules apply to GitHub Copilot: select an exact stable/Beta application,
+approve narrow project roots, and inspect tool calls. Saved documents and linked
+assets must be inside those roots. Existing unsaved user documents are refused.
+Destructive text edits require operator configuration
+`INDESIGN_ALLOW_DESTRUCTIVE=1` plus `confirmDestructive: true` in the call.
+The argument alone is not human approval. The abbreviated examples below omit
+that policy/acknowledgement; do not bypass a denied operation or enable arbitrary
+code to work around it. Start with disposable documents, not production files.
+
+For native Data Merge, use `inspect_data_merge` to distinguish actual bindings
+from literal `<<Field>>` text. Use the typed CSV/source/mapping/export tools in
+[README's Native Data Merge workflow](README.md#native-data-merge), not the removed
+legacy `data_merge` routine or arbitrary code. Mutations require the discovered
+document ID and saved path, explicit native field/frame IDs, approved assets and
+per-call confirmation. Export a small selected-record proof before production;
+this does not upload assets or run an FFCPE cloud workflow.
+
 ### 🎯 Problem Solved: Selected Text Frames & Markdown Formatting
 
 This enhanced MCP server now provides tools that Claude needs to work efficiently with InDesign:
