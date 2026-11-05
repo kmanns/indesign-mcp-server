@@ -728,7 +728,7 @@ export class InDesignMCPServer {
             type: 'object',
             properties: {
               profile: { type: 'string', description: 'Preflight profile name' },
-              scope: { type: 'string', enum: ['document', 'selection'], default: 'document' },
+              scope: { type: 'string', enum: ['document'], description: 'Only document scope is supported', default: 'document' },
             },
           },
         },
@@ -936,14 +936,36 @@ export class InDesignMCPServer {
         "No document open";
       } else {
         var doc = app.activeDocument;
+        function documentFlag(property) {
+          try {
+            var value = doc[property];
+            return typeof value === "boolean" ? value : "Unavailable (not a boolean)";
+          } catch (e) {
+            return "Unavailable (" + e.message + ")";
+          }
+        }
+        var saved = documentFlag("saved");
+        var filePath = "Unavailable (saved state unknown)";
+        if (saved === false) {
+          filePath = "Unsaved (no current file path)";
+        } else if (saved === true) {
+          try {
+            filePath = doc.fullName.fsName;
+            if (!filePath) filePath = "Unavailable (empty fullName)";
+          } catch (e) {
+            filePath = "Unavailable (" + e.message + ")";
+          }
+        }
         var info = "=== DOCUMENT INFORMATION ===\\n";
         info += "Name: " + doc.name + "\\n";
         info += "Pages: " + doc.pages.length + "\\n";
         info += "Width: " + doc.documentPreferences.pageWidth + "\\n";
         info += "Height: " + doc.documentPreferences.pageHeight + "\\n";
         info += "Facing Pages: " + doc.documentPreferences.facingPages + "\\n";
-        info += "Modified: " + doc.modified + "\\n";
-        info += "File Path: " + (doc.fullName ? doc.fullName.fsName : "Unsaved") + "\\n";
+        info += "Saved: " + saved + "\\n";
+        info += "Modified: " + documentFlag("modified") + "\\n";
+        info += "Converted: " + documentFlag("converted") + "\\n";
+        info += "File Path: " + filePath + "\\n";
         info += "\\n=== MARGINS ===\\n";
         info += "Top: " + doc.marginPreferences.top + "\\n";
         info += "Bottom: " + doc.marginPreferences.bottom + "\\n";
@@ -3901,31 +3923,59 @@ Usage: INDESIGN_ALLOW_ARBITRARY_CODE=1 node index.js`
   // =================== ADDITIONAL UTILITIES ===================
   async preflightDocument(args) {
     const { profile, scope = 'document' } = args;
+    if (scope !== 'document') throw new Error('Preflight supports document scope only; selection scope is unavailable');
 
     const script = `
       if (app.documents.length === 0) {
         "No document open";
       } else {
         var doc = app.activeDocument;
+        var preflightProcess = null;
+        var preflightError = "";
+        var preflightReport = "";
         try {
           var preflightProfile;
+          if (!app.preflightProcesses || !app.preflightProfiles || app.preflightProfiles.length === 0) {
+            throw new Error("Preflight API or profiles are unavailable in this InDesign build");
+          }
           
           ${profile ? `
             preflightProfile = app.preflightProfiles.itemByName(${jsxString(profile)});
             if (!preflightProfile.isValid) {
-              preflightProfile = app.preflightProfiles[0];
+              throw new Error("Requested preflight profile is not installed: " + ${jsxString(profile)});
             }
           ` : `
             preflightProfile = app.preflightProfiles[0];
           `}
           
-          var preflightResults = doc.preflightProcesses.add(preflightProfile);
-          var errorCount = preflightResults.preflightResultsData.length;
-          
-          "Preflight check completed. Found " + errorCount + " issues.";
+          if (!preflightProfile || !preflightProfile.isValid) {
+            throw new Error("Preflight profile is unavailable");
+          }
+          preflightProcess = app.preflightProcesses.add(doc, preflightProfile);
+          if (!preflightProcess || !preflightProcess.isValid) {
+            throw new Error("Preflight process could not be created");
+          }
+          if (preflightProcess.waitForProcess(10) !== true) {
+            throw new Error("Preflight did not finish within 10 seconds; no completed report is available");
+          }
+          var processResults = preflightProcess.processResults;
+          if (typeof processResults !== "string") {
+            throw new Error("Preflight processResults are unavailable in this InDesign build");
+          }
+          preflightReport = "Preflight check completed.\\nProfile: " + preflightProfile.name + "\\n" + processResults;
         } catch (e) {
-          "Error running preflight: " + e.message;
+          preflightError = e.message;
+        } finally {
+          if (preflightProcess) {
+            try {
+              preflightProcess.remove();
+            } catch (cleanupError) {
+              preflightError += (preflightError ? "; " : "") + "Could not remove temporary preflight process: " + cleanupError.message;
+            }
+          }
         }
+        if (preflightError) throw new Error("Error running preflight: " + preflightError);
+        preflightReport;
       }
     `;
 

@@ -537,6 +537,23 @@ verification. Some advanced legacy features (EPUB, preflight, packaging and data
 merge in particular) depend on the installed Adobe DOM and may return explicit
 errors; do not assume a successful mock/parse check proves live API support.
 
+`get_document_info` reports Saved, Modified and Converted independently. Unsaved
+documents have no current file path; an empty path after opening a template does
+not prove conversion and is never replaced with the input filename. Unsupported
+state properties are labeled Unavailable. Existing active-document ownership,
+approved-path and linked-asset guards still apply to these diagnostics.
+
+`preflight_document` runs document scope only; selection scope is explicitly
+rejected. It creates an application-owned process with the active document and
+the requested installed profile (or the first installed profile when omitted),
+waits up to 10 seconds and returns the native `processResults` report, not a count
+inferred from a result array. Missing profiles, unsupported APIs, incomplete runs
+and cleanup failures are errors. Only the process created by this request is
+removed; no document preflight preferences or existing processes are changed.
+This lifecycle follows Adobe's [PreflightProcesses](https://developer.adobe.com/indesign/dom/api/p/PreflightProcesses/)
+and [PreflightProcess](https://developer.adobe.com/indesign/dom/api/p/PreflightProcess/)
+DOM references; native stable/Beta verification is still required.
+
 A bounded live validation on InDesign Beta 22.0.0.96 created a new one-page A5
 layout, added seven text frames and RGB swatches/shapes, saved INDD and exported
 PDF. The document reported no overset frames, and the actual PDF was checked for

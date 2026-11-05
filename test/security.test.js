@@ -264,6 +264,179 @@ test('requests serialize and pass an atomic document identity guard to execution
   assert.deepEqual(guards.map(guard => guard.id), [9, 9]);
 });
 
+test('document diagnostics report saved state without reading an unsaved fullName or inferring conversion', async t => {
+  const f = fixture(t);
+  await f.server.handleTool('get_document_info');
+  const script = f.scripts.at(-1).script;
+  for (const saved of [true, false]) {
+    for (const converted of [true, false, undefined]) {
+      let pathReads = 0;
+      const doc = {
+        name: 'Template.indd', saved, converted, modified: true,
+        pages: [], documentPreferences: { pageWidth: 100, pageHeight: 200, facingPages: false },
+        marginPreferences: { top: 10, bottom: 10, left: 10, right: 10 },
+        layers: [], swatches: [],
+        get fullName() {
+          pathReads++;
+          if (!saved) throw new Error('Unsaved documents have no full name.');
+          return { fsName: f.input };
+        },
+      };
+      const report = vm.runInNewContext(script, { app: { documents: [doc], activeDocument: doc } });
+      assert.match(report, new RegExp(`Saved: ${saved}\\n`));
+      assert.match(report, /Modified: true\n/);
+      assert.match(report, new RegExp(`Converted: ${converted === undefined ? 'Unavailable' : converted}`));
+      assert.ok(report.includes(`File Path: ${saved ? f.input : 'Unsaved (no current file path)'}`));
+      assert.equal(pathReads, saved ? 1 : 0);
+    }
+  }
+  const doc = {
+    name: 'Template.indd', saved: true, pages: [], documentPreferences: {}, marginPreferences: {},
+    layers: [], swatches: [],
+    get fullName() { throw new Error('Path unavailable'); },
+    get converted() { throw new Error('Unsupported property'); },
+  };
+  let report = vm.runInNewContext(script, { app: { documents: [doc], activeDocument: doc } });
+  assert.match(report, /File Path: Unavailable \(Path unavailable\)/);
+  assert.match(report, /Converted: Unavailable \(Unsupported property\)/);
+  assert.match(report, /Modified: Unavailable/);
+  Object.defineProperty(doc, 'saved', { get() { throw new Error('Saved unavailable'); } });
+  report = vm.runInNewContext(script, { app: { documents: [doc], activeDocument: doc } });
+  assert.match(report, /Saved: Unavailable \(Saved unavailable\)/);
+  assert.match(report, /File Path: Unavailable \(saved state unknown\)/);
+  assert.equal(vm.runInNewContext(script, { app: { documents: [] } }), 'No document open');
+});
+
+test('diagnostic tools preserve unsaved ownership, linked asset and atomic document guards', async t => {
+  const f = fixture(t);
+  for (const tool of ['get_document_info', 'preflight_document']) {
+    for (const document of [
+      { id: 2, path: '', links: [] },
+      { id: 3, path: f.input, links: ['/etc/passwd'] },
+      { id: 4, path: '/etc/passwd', links: [] },
+    ]) {
+      let calls = 0;
+      f.bridge.execute = async () => { calls++; return { text: '', document }; };
+      const response = await f.server.handleTool(tool);
+      assert.equal(response.isError, true);
+      assert.equal(calls, 1, 'Guard failure must prevent diagnostic dispatch');
+    }
+    const document = { id: 2, path: '', links: [] };
+    f.bridge.execute = async (script, expected) => {
+      if (script !== '"";' && f.server.currentTool !== 'open_document') assert.deepEqual(expected, document);
+      return { text: 'ok', document };
+    };
+    const opened = await f.server.handleTool('open_document', { filePath: f.input });
+    assert.equal(opened.isError, false, JSON.stringify(opened));
+    assert.equal(f.server.unsavedDocuments.has(2), true);
+    assert.equal((await f.server.handleTool(tool)).isError, false);
+    f.server.unsavedDocuments.delete(2);
+  }
+});
+
+test('preflight uses application ownership, waits for completion and removes only its own process', async t => {
+  const f = fixture(t);
+  for (const profile of [undefined, 'Requested profile']) {
+    await f.server.handleTool('preflight_document', profile ? { profile } : {});
+    const script = f.scripts.at(-1).script;
+    const events = [];
+    const selectedProfile = { isValid: true, name: profile ?? 'Default profile' };
+    const doc = { get preflightProcesses() { assert.fail('Processes belong to the application'); } };
+    const process = {
+      isValid: true,
+      waitForProcess(seconds) { events.push('wait'); assert.equal(seconds, 10); return true; },
+      get processResults() { events.push('results'); return 'Native report: missing font on page 2'; },
+      remove() { events.push('remove'); },
+    };
+    const existing = { remove() { assert.fail('Must not remove an existing process'); } };
+    const app = {
+      documents: [doc], activeDocument: doc,
+      preflightProfiles: { length: 1, 0: selectedProfile, itemByName(name) {
+        assert.equal(name, profile); return selectedProfile;
+      } },
+      preflightProcesses: { 0: existing, add(target, appliedProfile) {
+        events.push('add'); assert.equal(target, doc); assert.equal(appliedProfile, selectedProfile);
+        return process;
+      } },
+    };
+    const report = vm.runInNewContext(script, { app });
+    assert.equal(report, `Preflight check completed.\nProfile: ${selectedProfile.name}\nNative report: missing font on page 2`);
+    assert.deepEqual(events, ['add', 'wait', 'results', 'remove']);
+    assert.equal(vm.runInNewContext(script, { app: { documents: [] } }), 'No document open');
+  }
+});
+
+test('preflight reports unsupported APIs, profiles, timeouts, result and cleanup failures as MCP errors', async t => {
+  const f = fixture(t);
+  const cases = [
+    ['missing API', /Preflight API or profiles are unavailable/],
+    ['throwing API', /Unsupported preflightProcesses/],
+    ['no profiles', /Preflight API or profiles are unavailable/],
+    ['missing profile', /Requested preflight profile is not installed/],
+    ['invalid default profile', /Preflight profile is unavailable/],
+    ['add failure', /Cannot add process/],
+    ['invalid process', /Preflight process could not be created/],
+    ['timeout', /did not finish within 10 seconds/],
+    ['wait failure', /Cannot wait/],
+    ['results failure', /Cannot read results/],
+    ['unsupported results', /processResults are unavailable/],
+    ['cleanup failure', /Could not remove temporary preflight process: Cannot remove/],
+    ['timeout and cleanup failure', /did not finish within 10 seconds.*Could not remove temporary preflight process/],
+  ];
+  for (const [scenario, message] of cases) {
+    let removed = 0, resultsRead = 0, added = 0;
+    const doc = {};
+    const process = {
+      isValid: scenario !== 'invalid process',
+      waitForProcess() {
+        if (scenario === 'wait failure') throw new Error('Cannot wait');
+        return !scenario.startsWith('timeout');
+      },
+      get processResults() {
+        resultsRead++;
+        if (scenario === 'results failure') throw new Error('Cannot read results');
+        return scenario === 'unsupported results' ? undefined : 'Native results';
+      },
+      remove() {
+        removed++;
+        if (scenario.includes('cleanup failure')) throw new Error('Cannot remove');
+      },
+    };
+    const profile = { isValid: !['missing profile', 'invalid default profile'].includes(scenario), name: 'Profile' };
+    const app = {
+      documents: [doc], activeDocument: doc,
+      preflightProfiles: { length: scenario === 'no profiles' ? 0 : 1, 0: profile, itemByName: () => profile },
+      preflightProcesses: { add() {
+        added++;
+        if (scenario === 'add failure') throw new Error('Cannot add process');
+        return process;
+      } },
+    };
+    if (scenario === 'missing API') delete app.preflightProcesses;
+    if (scenario === 'throwing API') {
+      Object.defineProperty(app, 'preflightProcesses', { get() { throw new Error('Unsupported preflightProcesses'); } });
+    }
+    f.bridge.execute = async script => ({
+      text: script === '"";' ? '' : vm.runInNewContext(script, { app }),
+      document: null,
+    });
+    const response = await f.server.handleTool('preflight_document', scenario === 'missing profile' ? { profile: 'Absent' } : {});
+    assert.equal(response.isError, true, scenario);
+    assert.match(response.content[0].text, message, scenario);
+    assert.doesNotMatch(response.content[0].text, /Preflight check completed/);
+    assert.equal(removed, added && scenario !== 'add failure' ? 1 : 0, scenario);
+    if (scenario.startsWith('timeout') || scenario === 'wait failure' || scenario === 'invalid process') {
+      assert.equal(resultsRead, 0, scenario);
+    }
+  }
+  f.scripts.length = 0;
+  f.bridge.execute = async () => { assert.fail('Selection scope must not dispatch'); };
+  const response = await f.server.handleTool('preflight_document', { scope: 'selection' });
+  assert.equal(response.isError, true);
+  assert.match(response.content[0].text, /Invalid arguments:.*scope.*document/);
+  await assert.rejects(f.server.preflightDocument({ scope: 'selection' }), /document scope only/);
+});
+
 test('PDF export resolves installed preset names, uses supported properties and restores global preferences', async t => {
   const f = fixture(t);
   const response = await f.server.handleTool('export_pdf', {
